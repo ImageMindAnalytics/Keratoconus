@@ -12,8 +12,11 @@ import math
 from typing import Optional, Tuple
 import pandas as pd 
 import torch
+import torch.nn.functional as F
+
 from torch import Tensor
 from torch.nn.modules.loss import _Loss
+import cv2
 
 def nmi_gauss(x1, x2, x1_bins, x2_bins, sigma=1e-3, e=1e-10):
     assert x1.shape == x2.shape, "Inputs are not of similar shape"
@@ -127,13 +130,10 @@ def pad_image_to_largest(image, largest_shape):
     pad_y = (largest_shape[0] - image_array.shape[0]) // 2
     pad_x = (largest_shape[1] - image_array.shape[1]) // 2
 
-    # Pad the array to match the largest dimensions
-    padded_array = np.pad(image_array,
-                          ((pad_y, largest_shape[0] - image_array.shape[0] - pad_y), (pad_x, largest_shape[1] - image_array.shape[1] - pad_x)),
-                          mode='constant', constant_values=0)
-
+    padded_array = np.stack([np.pad(image_array[:,:,c], ((pad_y, largest_shape[0] - image_array.shape[0] - pad_y),
+                                                         (pad_x, largest_shape[1] - image_array.shape[1] - pad_x))) for c in range(3)], axis=2)
     # Convert the padded array back to a SimpleITK image
-    padded_image = sitk.GetImageFromArray(padded_array)
+    padded_image = sitk.GetImageFromArray(padded_array, isVector=True)
     
     # Manually copy the origin, spacing, and direction from the original image
     padded_image.SetOrigin(image.GetOrigin())
@@ -172,7 +172,10 @@ def compute_mean_image(cropped_images):
         mean_image = np.mean([sitk.GetArrayFromImage(img) for img in cropped_images], axis=0)
 
     # Convert the mean numpy array back to a SimpleITK image and copy the metadata from the first image
-    mean_image_itk = sitk.GetImageFromArray(mean_image)
+    if mean_image.max() <2 :
+        mean_image = (mean_image * 255)
+        
+    mean_image_itk = sitk.GetImageFromArray(mean_image.astype(np.uint8), isVector=True)
 
     if isinstance(cropped_images[0], tuple):  # Handle both cases where it's (path, img) or just img
         reference_image = cropped_images[1][1]
@@ -200,14 +203,14 @@ def load_images(folder, csv):
 def normalize_image(image):
     image_array = sitk.GetArrayFromImage(image).astype(np.float32)
     # convert to grayscale 
-    image_array = (0.2126*image_array[:,:,0] + 0.7152*image_array[:,:,1] + 0.0722*image_array[:,:,2])
+    # image_array = (0.2126*image_array[:,:,0] + 0.7152*image_array[:,:,1] + 0.0722*image_array[:,:,2])
+
+    image_array = cv2.resize(image_array, (1536,2048),interpolation=cv2.INTER_CUBIC)
 
     norm_img = (image_array - image_array.min()) / (image_array.max() - image_array.min() + 1e-8)
-    # isVector=True to indicate the last dimension represents vector components (channels), not a spatial dimension.
-    norm_img = sitk.GetImageFromArray(norm_img)
-    if norm_img.GetDimension() != image.GetDimension():
-        raise ValueError(f"Dimension mismatch: original image {image.GetDimension()}D, normalized image {norm_img.GetDimension()}D")
 
+    # isVector=True to indicate the last dimension represents vector components (channels), not a spatial dimension.
+    norm_img = sitk.GetImageFromArray(norm_img, isVector=True)
 
     # Copy the origin, spacing, and direction from the original image
     norm_img.SetOrigin(image.GetOrigin())
@@ -215,68 +218,72 @@ def normalize_image(image):
     norm_img.SetDirection(image.GetDirection())
 
     return norm_img
-def dice_loss(x1, x2):
-    dim = [2, 3, 4] if len(x2.shape) == 5 else [0, 1]
-    inter = torch.sum(x1 * x2, dim=dim)
-    union = torch.sum(x1 + x2, dim=dim)
-    return 1 - (2. * inter / union).mean()
+
 
 def registration(mean, input_img, image_path, iter, patient_id, output_folder, param_sampler):
     # Save the registered image
     image_folder = os.path.join(output_folder, f'iter_{iter}')
     if not os.path.exists(image_folder):
         os.makedirs(image_folder)
-    image_path = os.path.join(image_folder, patient_id.replace('.png', 'registered.jpg'))
+    name = patient_id.split('.png')[0]
+    image_path = os.path.join(image_folder, f'{name}_registered.png')
     
     best_loss = 0.0  # Initialize to track the best loss
     best_image = input_img
-    # for params in param_sampler:
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    print(f"\n\033[1mIteration: {iter} -- Using {device.upper()} -- Registering : {image_path} with mean\033[0m")
+    for params in param_sampler:
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-    moving = torch.from_numpy(sitk.GetArrayFromImage(input_img)).float().to(device)
-    static = torch.from_numpy(sitk.GetArrayFromImage(mean)).float().to(device)
+        moving = torch.from_numpy(sitk.GetArrayFromImage(input_img)).float().to(device)
+        static = torch.from_numpy(sitk.GetArrayFromImage(mean)).float().to(device)
 
-    # Normalize the images
-    epsilon = 1e-8    # Small value to avoid division by zero
-    moving_normed = (moving - moving.min()) / (moving.max() - moving.min() + epsilon)
-    static_normed = (static - static.min()) / (static.max() - static.min() + epsilon)
+        # Normalize the images
+        epsilon = 1e-8    # Small value to avoid division by zero
+        moving_normed = (moving - moving.min()) / (moving.max() - moving.min() + epsilon)
+        static_normed = (static - static.min()) / (static.max() - static.min() + epsilon)
 
-    # Initialize NMI loss function for rigid registration
-    nmi_loss_function_rigid = NMI(intensity_range=None, nbins=64, sigma=0.05, use_mask=False)
+        moving_normed = moving_normed.permute(2,1,0).unsqueeze(0)
+        static_normed = static_normed.permute(2,1,0).unsqueeze(0)
 
-    # Initialize AffineRegistration for Rigid registration
-    reg_rigid = AffineRegistration(scales=(4, 2), iterations=(100, 30), is_3d=False,
-                                   dissimilarity_function=nmi_loss_function_rigid.metric, 
-                                    # dissimilarity_function=dice_loss, 
-                                    optimizer=torch.optim.Adam,
-                                    with_translation=True, with_rotation=True, with_zoom=False, with_shear=False,
-                                    align_corners=True, padding_mode='zeros')
-    
-    # Perform rigid registration
-    moved_image = reg_rigid(moving_normed[None, None], static_normed[None, None])[0, 0]
 
-    # Compute the final loss
-    final_loss = dice_loss(moved_image, static_normed)
-    print(f"Final Loss (NMI): {final_loss}")
+        # Initialize NMI loss function for rigid registration
+        nmi_loss_function_rigid = NMI(intensity_range=None, nbins=64, sigma=params['sigma_rigid'], use_mask=False)
 
-    image = sitk.GetImageFromArray(moved_image.cpu().numpy())
-
-    image.SetOrigin(mean.GetOrigin())
-    image.SetSpacing(mean.GetSpacing())
-    image.SetDirection(mean.GetDirection())
-
-    if final_loss > best_loss and final_loss > 1e-5:
-        best_loss = final_loss
-        print(f"New best parameters found with loss: {best_loss}")
+        # Initialize AffineRegistration for Rigid registration
+        reg_rigid = AffineRegistration( scales=(4, 2),
+                                        iterations=(100, 30), 
+                                        is_3d=False,
+                                        dissimilarity_function=nmi_loss_function_rigid.metric, 
+                                        learning_rate=params['learning_rate_rigid'],
+                                        optimizer=torch.optim.Adam,
+                                        with_translation=True, with_rotation=True, with_zoom=True, 
+                                        with_shear=False,
+                                        align_corners=True, padding_mode='zeros')
         
-        best_image = image
-        # sitk.WriteImage(image, image_path)
-        image = sitk.Cast(255*image, sitk.sitkUInt8)
-        writer = sitk.ImageFileWriter()
-        writer.SetFileName(image_path)
-        writer.UseCompressionOn()
-        writer.Execute(image)
+        # Perform rigid registration
+        moved_image = reg_rigid(moving_normed, static_normed)
+
+        # Compute the final loss
+        final_loss = -nmi_loss_function_rigid.metric(moved_image, static_normed)
+
+        moved_image = moved_image[0].permute(2,1,0).cpu().numpy()
+        moved_image = (moved_image * 255).astype(np.uint8)
+        image = sitk.GetImageFromArray(moved_image,isVector=True)
+
+        image.SetOrigin(mean.GetOrigin())
+        image.SetSpacing(mean.GetSpacing())
+        image.SetDirection(mean.GetDirection())
+
+        if final_loss > best_loss and final_loss > 1e-5:
+            best_loss = final_loss
+            print(f"New best parameters found with loss: {best_loss}")
+            
+            best_image = image
+            # sitk.WriteImage(image, image_path)
+            # image = sitk.Cast(255*image, sitk.sitkUInt8)
+            writer = sitk.ImageFileWriter()
+            writer.SetFileName(image_path)
+            writer.UseCompressionOn()
+            writer.Execute(image)
 
     return best_image
 
@@ -296,9 +303,9 @@ def main(args, param_sampler):
     padded_images = pad_all_images_to_largest(images)
 
     # Compute the mean of the padded images
-    mean_image = 255*compute_mean_image(padded_images)
+    mean_image = compute_mean_image(padded_images)
     mean_path = os.path.join(args.output_folder, 'mean_image.jpg')
-    mean_image = sitk.Cast(mean_image, sitk.sitkUInt8)
+    # mean_image = sitk.Cast(mean_image, sitk.sitkUInt8)
     writer = sitk.ImageFileWriter()
     writer.SetFileName(mean_path)
     writer.UseCompressionOn()
@@ -306,6 +313,7 @@ def main(args, param_sampler):
 
     for iteration in range(args.num_iterations):
         # Register all images to the current mean
+        print(f'iteration {iteration}/10')
         registered_images = []
         for path, img in padded_images:
             patient_id = os.path.basename(path)
@@ -316,11 +324,12 @@ def main(args, param_sampler):
         padded_images = registered_images
         
         # Compute the new mean from the registered images
-        mean_image = 255*compute_mean_image(registered_images)
+        mean_image = compute_mean_image(registered_images)
 
         # Save the final mean image
-        mean_path.replace('.jpg', f"iter_{iteration}.jpg")
-        mean_image = sitk.Cast(mean_image, sitk.sitkUInt8)
+        mean_path= mean_path.split('iter_')[0] + f"iter_{iteration}.jpg"
+        print(mean_path)
+        # mean_image = sitk.Cast(mean_image, sitk.sitkUInt8)
         writer = sitk.ImageFileWriter()
         writer.SetFileName(mean_path)
         writer.UseCompressionOn()
